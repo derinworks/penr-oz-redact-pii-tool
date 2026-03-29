@@ -4,6 +4,7 @@ from pathlib import Path
 
 import fitz
 
+from pii_redact.detector import detect_pii, extract_page_words
 from pii_redact.redactor import redact_pdf
 
 
@@ -130,3 +131,78 @@ def test_redact_pdf_preserves_form_titles_and_instruction_lines(tmp_path: Path) 
         assert "Schedule 1" in text
         assert "AB1234" not in text
         assert "NY-12345" not in text
+
+
+def test_detect_pii_separates_first_and_last_name_fields() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_textbox(
+        fitz.Rect(72, 72, 540, 200),
+        "First name John Last name Doe",
+        fontsize=12,
+    )
+
+    detections = detect_pii(extract_page_words(page), ["name"], "text")
+    document.close()
+
+    values = {detection.value for detection in detections}
+    assert "John" in values
+    assert "Doe" in values
+    assert all("Last name" not in detection.value for detection in detections)
+    assert all("First name" not in detection.value for detection in detections)
+
+
+def test_redact_pdf_redacts_company_name_address_columns_and_payer_state(tmp_path: Path) -> None:
+    source = tmp_path / "input.pdf"
+    output = tmp_path / "output.pdf"
+    _make_text_pdf(
+        source,
+        "\n".join(
+            [
+                "Company name / Trade / Business / Aggregation name",
+                "Acme Holdings LLC",
+                "Physical address",
+                "123 Main Street",
+                "Suite 9",
+                "Payer's state no.",
+                "CA-98765",
+                "Control number",
+                "CN7788",
+                "EIN",
+                "1 2 2 3 4 2 3 4 5",
+            ]
+        ),
+    )
+
+    redact_pdf(source, output)
+
+    with fitz.open(output) as redacted_doc:
+        text = "\n".join(page.get_text() for page in redacted_doc)
+        assert "Acme Holdings LLC" not in text
+        assert "123 Main Street" not in text
+        assert "Suite 9" not in text
+        assert "CA-98765" not in text
+        assert "CN7788" not in text
+        assert "1 2 2 3 4 2 3 4 5" not in text
+
+
+def test_redact_pdf_redacts_values_under_pii_table_headers(tmp_path: Path) -> None:
+    source = tmp_path / "input.pdf"
+    output = tmp_path / "output.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Name", fontsize=12)
+    page.insert_text((230, 72), "Control number", fontsize=12)
+    page.insert_text((72, 96), "Jane Public", fontsize=12)
+    page.insert_text((230, 96), "W2-4455", fontsize=12)
+    page.insert_text((72, 120), "Form 1040 Title", fontsize=12)
+    document.save(source)
+    document.close()
+
+    redact_pdf(source, output)
+
+    with fitz.open(output) as redacted_doc:
+        text = "\n".join(page.get_text() for page in redacted_doc)
+        assert "Jane Public" not in text
+        assert "W2-4455" not in text
+        assert "Form 1040 Title" in text
