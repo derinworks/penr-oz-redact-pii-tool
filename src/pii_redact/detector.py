@@ -45,6 +45,11 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\bstreet address\b", re.IGNORECASE),
         re.compile(r"\baddress\b", re.IGNORECASE),
     ),
+    "zip": (
+        re.compile(r"\bzip code\b", re.IGNORECASE),
+        re.compile(r"\bpostal code\b", re.IGNORECASE),
+        re.compile(r"\bzip\b", re.IGNORECASE),
+    ),
     "state_id": (
         re.compile(r"\bemployer'?s state id number\b", re.IGNORECASE),
         re.compile(r"\bstate id number\b", re.IGNORECASE),
@@ -68,6 +73,7 @@ STREET_ADDRESS_PATTERN = re.compile(
 CITY_STATE_ZIP_PATTERN = re.compile(
     r"\b[A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"
 )
+DIRECT_PATTERN_TYPES = {"ssn", "ein", "email", "phone"}
 
 
 def extract_page_words(page: fitz.Page) -> list[WordBox]:
@@ -111,6 +117,8 @@ def _detect_word_level(
     detections: list[Detection] = []
     for word in words:
         for pii_type in pii_types:
+            if pii_type not in DIRECT_PATTERN_TYPES:
+                continue
             pattern = PII_PATTERNS.get(pii_type)
             if pattern and pattern.fullmatch(word.text):
                 detections.append(
@@ -132,6 +140,8 @@ def _detect_line_patterns(
     detections: list[Detection] = []
     for line in lines:
         for pii_type in pii_types:
+            if pii_type not in DIRECT_PATTERN_TYPES:
+                continue
             pattern = PII_PATTERNS.get(pii_type)
             if not pattern:
                 continue
@@ -165,6 +175,7 @@ def _detect_labeled_fields(
                     if value_start >= value_end:
                         continue
                     matched_words = _words_covering_span(line, value_start, value_end)
+                    matched_words = _trim_labeled_value_words(matched_words, pii_type)
                     if not matched_words:
                         continue
                     detections.append(
@@ -198,6 +209,18 @@ def _detect_address_lines(
                 )
             )
     return detections
+
+
+def _trim_labeled_value_words(words: list[WordBox], pii_type: str) -> list[WordBox]:
+    trimmed = list(words)
+    if pii_type == "zip":
+        trimmed = [word for word in trimmed if PII_PATTERNS["zip"].fullmatch(word.text)]
+    elif pii_type in {"state_id", "control_number"}:
+        while trimmed and not re.search(r"\d", trimmed[0].text):
+            trimmed.pop(0)
+        while trimmed and not re.search(r"\d", trimmed[-1].text):
+            trimmed.pop()
+    return trimmed
 
 
 def _detect_split_numeric_fields(
