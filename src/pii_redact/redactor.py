@@ -5,7 +5,7 @@ from pathlib import Path
 
 import fitz
 
-from .detector import Detection, detect_direct_text_pii, detect_pii, detect_widget_pii, extract_page_words
+from .detector import Detection, detect_pii, detect_widget_pii, extract_page_words
 from .ocr import extract_ocr_words
 from .patterns import normalize_pii_types
 
@@ -46,21 +46,24 @@ def redact_pdf(
             page_widgets = list(page.widgets() or [])
             widget_detections = detect_widget_pii(page, normalized_types)
             widget_xrefs = {item.xref for item in widget_detections}
+            detections: list[Detection] = []
             source = "text"
-            if widget_detections:
-                source = "widget"
-                detections = [item.detection for item in widget_detections]
-            elif page_widgets:
-                direct_types = [pii_type for pii_type in normalized_types if pii_type in {"ssn", "ein", "email", "phone"}]
-                detections = detect_direct_text_pii(word_boxes, direct_types, source)
-            elif word_boxes:
-                detections = detect_pii(word_boxes, normalized_types, source)
+
+            if word_boxes:
+                detections.extend(detect_pii(word_boxes, normalized_types, "text"))
             elif ocr_fallback:
                 source = "ocr"
                 ocr_words = extract_ocr_words(input_path, page_number, page.rect)
                 detections = detect_pii(ocr_words, normalized_types, source)
-            else:
-                detections = []
+
+            if widget_detections:
+                detections.extend(item.detection for item in widget_detections)
+
+            detections = _dedupe_detections(detections)
+            if widget_detections and detections:
+                source = "mixed" if any(detection.source == "text" for detection in detections) else "widget"
+            elif detections:
+                source = detections[0].source
 
             for detection in detections:
                 page.add_redact_annot(detection.rect, fill=(0, 0, 0))
@@ -81,3 +84,22 @@ def redact_pdf(
         )
 
     return RedactionResult(output_path=output_path, pages=pages)
+
+
+def _dedupe_detections(detections: list[Detection]) -> list[Detection]:
+    seen: set[tuple[str, str, int, int, int, int]] = set()
+    deduped: list[Detection] = []
+    for detection in detections:
+        key = (
+            detection.pii_type,
+            detection.value,
+            round(detection.rect.x0),
+            round(detection.rect.y0),
+            round(detection.rect.x1),
+            round(detection.rect.y1),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(detection)
+    return deduped

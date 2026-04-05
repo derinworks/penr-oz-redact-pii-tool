@@ -22,6 +22,20 @@ def _make_text_pdf(path: Path, text: str) -> None:
     document.close()
 
 
+def _add_text_widget(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    field_name: str,
+    value: str,
+) -> None:
+    widget = fitz.Widget()
+    widget.field_name = field_name
+    widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+    widget.rect = rect
+    widget.field_value = value
+    page.add_widget(widget)
+
+
 def test_redact_pdf_removes_extractable_ssn_and_email(tmp_path: Path) -> None:
     source = tmp_path / "input.pdf"
     output = tmp_path / "output.pdf"
@@ -360,3 +374,123 @@ def test_widget_classification_redacts_taxpayer_identification_number_as_ssn() -
     document.close()
 
     assert pii_type == "ssn"
+
+
+def test_redact_pdf_on_widget_pages_still_redacts_printed_issue_fields(tmp_path: Path) -> None:
+    source = tmp_path / "widget-page-printed-pii.pdf"
+    output = tmp_path / "widget-page-printed-pii-redacted.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_textbox(
+        fitz.Rect(72, 72, 540, 760),
+        "\n".join(
+            [
+                "(3) SSN",
+                "111 22 3333",
+                "Physical address of each property",
+                "123 Main Street",
+                "PAYER'S address",
+                "456 Oak Road",
+                "SCHEDULE C: Acme Holdings LLC",
+                "Control number",
+                "AB1234",
+            ]
+        ),
+        fontsize=12,
+    )
+    _add_text_widget(page, fitz.Rect(360, 72, 500, 90), "non_pii_note", "")
+    document.save(source)
+    document.close()
+
+    result = redact_pdf(source, output)
+
+    assert result.total_redactions >= 5
+
+    with fitz.open(output) as redacted_doc:
+        text = "\n".join(page.get_text() for page in redacted_doc)
+        assert "111 22 3333" not in text
+        assert "123 Main Street" not in text
+        assert "456 Oak Road" not in text
+        assert "Acme Holdings LLC" not in text
+        assert "AB1234" not in text
+
+
+def test_redact_pdf_redacts_split_dependent_ssn_widgets(tmp_path: Path) -> None:
+    source = tmp_path / "split-dependent-ssn.pdf"
+    output = tmp_path / "split-dependent-ssn-redacted.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "(3) SSN", fontsize=12)
+    _add_text_widget(page, fitz.Rect(72, 86, 110, 104), "table_dependents.row1.ssn_1", "111")
+    _add_text_widget(page, fitz.Rect(116, 86, 145, 104), "table_dependents.row1.ssn_2", "22")
+    _add_text_widget(page, fitz.Rect(151, 86, 205, 104), "table_dependents.row1.ssn_3", "3333")
+    document.save(source)
+    document.close()
+
+    result = redact_pdf(source, output, pii_types=["ssn"])
+
+    assert result.total_redactions >= 3
+
+    with fitz.open(output) as redacted_doc:
+        assert list(redacted_doc[0].widgets() or []) == []
+
+
+def test_detect_pii_redacts_labeled_same_row_split_dependent_ssn() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((93, 336), "SSN (3)        297  51  4004", fontsize=12)
+
+    detections = detect_pii(extract_page_words(page), ["ssn"], "text")
+    document.close()
+
+    values = {detection.value for detection in detections}
+    assert any("297" in value and "4004" in value for value in values)
+
+
+def test_detect_pii_redacts_schedule_e_mac_style_address_line() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Physical address of each property (street, city, state, ZIP code)", fontsize=12)
+    page.insert_text((72, 108), "561 BROADWAY B2, SOMERVILLE, MA, 02145", fontsize=12)
+
+    detections = detect_pii(extract_page_words(page), ["address"], "text")
+    document.close()
+
+    values = {detection.value for detection in detections}
+    assert any("561 BROADWAY B2" in value and "02145" in value for value in values)
+
+
+def test_detect_pii_redacts_1099r_payer_po_box_address() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (54, 48),
+        "PAYER'S name, street address, city or town, state or province, country, ZIP or foreign postal code, and telephone no.",
+        fontsize=10,
+    )
+    page.insert_text((55, 84), "PO BOX 173764 D999", fontsize=12)
+
+    detections = detect_pii(extract_page_words(page), ["address"], "text")
+    document.close()
+
+    values = {detection.value for detection in detections}
+    assert "PO BOX 173764 D999" in values
+
+
+def test_detect_pii_redacts_w2_numeric_control_number_and_city_zip_above_label() -> None:
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((50, 158), "Control number", fontsize=12)
+    page.insert_text((41, 168), "1178270", fontsize=12)
+    page.insert_text((41, 228), "BELMONT, MA - 02478", fontsize=12)
+    page.insert_text((48, 278), "Employee's address and ZIP code", fontsize=12)
+
+    detections = detect_pii(extract_page_words(page), ["address", "control_number"], "text")
+    document.close()
+
+    by_type = {(detection.pii_type, detection.value) for detection in detections}
+    assert ("control_number", "1178270") in by_type
+    assert any(
+        pii_type == "address" and "BELMONT, MA - 02478" in value
+        for pii_type, value in by_type
+    )

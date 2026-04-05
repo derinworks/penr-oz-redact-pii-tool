@@ -59,6 +59,7 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\btrade name\b", re.IGNORECASE),
         re.compile(r"\bbusiness name\b", re.IGNORECASE),
         re.compile(r"\baggregation name\b", re.IGNORECASE),
+        re.compile(r"\bschedule c\s*:", re.IGNORECASE),
         re.compile(r"\bname of (?:person|business|company|trade|aggregation)\b", re.IGNORECASE),
         re.compile(r"\bfull name\b", re.IGNORECASE),
     ),
@@ -66,9 +67,12 @@ LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\bemployer(?:'|’)?s name, address, and ZIP code\b", re.IGNORECASE),
         re.compile(r"\bemployer(?:'|’)?s address\b", re.IGNORECASE),
         re.compile(r"\bemployee address\b", re.IGNORECASE),
+        re.compile(r"\bemployee(?:'|’)?s address and ZIP code\b", re.IGNORECASE),
         re.compile(r"\bphysical address\b", re.IGNORECASE),
         re.compile(r"\bmailing address\b", re.IGNORECASE),
         re.compile(r"\bhome address\b", re.IGNORECASE),
+        re.compile(r"\bpayer(?:'|’)?s address\b", re.IGNORECASE),
+        re.compile(r"\bpayer(?:'|’)?s name, street address\b", re.IGNORECASE),
         re.compile(r"\bapt\.? no\.?\b", re.IGNORECASE),
         re.compile(r"\bcity, town(?:,? or post office)?\b", re.IGNORECASE),
         re.compile(r"\bcity, state, and ZIP code\b", re.IGNORECASE),
@@ -108,6 +112,7 @@ COLUMN_HEADER_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "ssn": (
         re.compile(r"^ssn$", re.IGNORECASE),
         re.compile(r"^\(\d+\)\s+ssn$", re.IGNORECASE),
+        re.compile(r"^ssn\s+\(\d+\)$", re.IGNORECASE),
     ),
     "ein": (re.compile(r"^ein$", re.IGNORECASE),),
 }
@@ -117,13 +122,17 @@ EIN_HINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 STREET_ADDRESS_PATTERN = re.compile(
+    r"(?:"
     r"\b\d+[A-Za-z0-9./#-]*\s+(?:[A-Za-z0-9.'#-]+\s+){0,6}"
     r"(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|court|ct|"
-    r"circle|cir|place|pl|way|terrace|ter|parkway|pkwy)\b",
+    r"circle|cir|place|pl|way|terrace|ter|parkway|pkwy)\b"
+    r"|"
+    r"\bP\.?\s*O\.?\s+Box\s+\d+[A-Za-z0-9-]*(?:\s+[A-Za-z0-9-]+){0,2}\b"
+    r")",
     re.IGNORECASE,
 )
 CITY_STATE_ZIP_PATTERN = re.compile(
-    r"\b[A-Za-z][A-Za-z .'-]+,?\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"
+    r"\b[A-Za-z][A-Za-z .'-]+,?\s+[A-Z]{2}(?:\s*,\s*|\s*-\s*|\s+)\d{5}(?:-\d{4})?\b"
 )
 DIRECT_PATTERN_TYPES = {"ssn", "ein", "email", "phone"}
 FIELD_COLUMN_TYPES = {"name", "address", "zip", "state_id", "control_number", "ein", "ssn"}
@@ -170,6 +179,7 @@ WIDGET_NAME_CONTEXT_PATTERN = re.compile(
     r"name of proprietor|employer.?s name|employee.?s first name|employee.?s name|"
     r"name of person with self-employment income|"
     r"payer.?s name|recipient.?s name|trade, business, or aggregation name|"
+    r"schedule c|"
     r"company name|trade name|business name|aggregation name|full name)",
     re.IGNORECASE,
 )
@@ -383,7 +393,14 @@ def _detect_column_header_fields(
             for pattern in COLUMN_HEADER_PATTERNS.get(pii_type, ()):
                 if not pattern.fullmatch(line.text.strip()):
                     continue
-                groups = _column_value_groups(lines, line.rect, pii_type)
+                groups = _candidate_value_groups(
+                    lines,
+                    line.rect,
+                    line.words,
+                    pii_type,
+                    len(line.text),
+                    len(line.text),
+                )
                 for matched_words in groups:
                     trimmed_words = _trim_labeled_value_words(matched_words, pii_type)
                     if not trimmed_words or not _looks_like_value(trimmed_words, pii_type):
@@ -679,6 +696,7 @@ def _candidate_value_groups(
     if label_line is not None:
         groups.extend(_same_line_value_groups(label_line, label_words, pii_type, label_end, next_label_start))
     groups.extend(_right_of_label_value_groups(lines, label_rect, pii_type))
+    groups.extend(_above_label_value_groups(lines, label_rect, pii_type))
     groups.extend(_below_label_value_groups(lines, label_rect, pii_type))
     groups.extend(_column_value_groups(lines, label_rect, pii_type))
     split_groups: list[list[WordBox]] = []
@@ -765,6 +783,39 @@ def _below_label_value_groups(
             accepted_groups += 1
             if accepted_groups >= ROW_VALUE_SCAN_LIMIT:
                 break
+    return groups
+
+
+def _above_label_value_groups(
+    lines: list[LineData],
+    label_rect: fitz.Rect,
+    pii_type: str,
+) -> list[list[WordBox]]:
+    groups: list[list[WordBox]] = []
+    x_min, x_max = _horizontal_window(label_rect, pii_type)
+    candidate_lines = sorted(
+        (
+            line
+            for line in lines
+            if line.rect.y1 <= label_rect.y1
+            and label_rect.y0 - line.rect.y1 <= 70
+            and label_rect.y0 - line.rect.y1 >= -4
+            and line.rect.x1 >= x_min
+            and line.rect.x0 <= x_max
+        ),
+        key=lambda line: (label_rect.y0 - line.rect.y1, line.rect.x0),
+    )
+    for prev_line in candidate_lines:
+        if _line_looks_like_header(prev_line.text):
+            continue
+        candidate_words = [
+            word
+            for word in prev_line.words
+            if _word_center_x(word) >= x_min and _word_center_x(word) <= x_max
+        ]
+        candidate_words = _trim_labeled_value_words(candidate_words, pii_type)
+        if candidate_words:
+            groups.append(candidate_words)
     return groups
 
 
@@ -925,6 +976,8 @@ def _horizontal_window(label_rect: fitz.Rect, pii_type: str, column_mode: bool =
         margin = 120 if column_mode else 140
     elif pii_type == "name":
         margin = 70 if column_mode else 90
+    elif pii_type in {"ssn", "ein"}:
+        margin = 120 if column_mode else 140
     else:
         margin = 80 if column_mode else 100
     x_max = max(label_rect.x1 + margin, label_rect.x0 + width + 40)
@@ -982,7 +1035,6 @@ def _looks_like_value(words: list[WordBox], pii_type: str) -> bool:
             and len(words) <= 4
             and len(text) <= 24
             and len(compact) >= 5
-            and bool(re.search(r"[A-Za-z-]", text))
             and lowered not in {"w-2", "w-3"}
             and "for" not in lowered
             and not re.fullmatch(r"\d+[—-][a-z]+", lowered)
@@ -1015,7 +1067,7 @@ def _classify_widget_value(
     combined_context = f"{lowered_field} {lowered_context}"
     compact_digits = re.sub(r"\D", "", value)
 
-    if "ssn" in pii_types and "table_dependents" in lowered_field and len(compact_digits) == 9:
+    if "ssn" in pii_types and "table_dependents" in lowered_field and len(compact_digits) in {2, 3, 4, 9}:
         return "ssn"
 
     if "ssn" in pii_types and (
